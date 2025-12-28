@@ -3595,7 +3595,7 @@ exports.cf3 = onRequest({
 
 
 
-    const modelUsed = 'gemini-3-pro-preview'; //pro
+    const modelUsed = 'gemini-3-pro-preview-bom'; //pro
     const vGenerationConfig = {
       temperature: 1,
       maxOutputTokens: 65535, // Kept as per your instruction
@@ -4300,7 +4300,7 @@ exports.cf5 = onRequest({
 
       const collectedUrls = new Set();
 
-      const modelUsed = 'gemini-3-pro-preview'; //pro
+      const modelUsed = 'gemini-3-pro-preview-bom'; //pro
       const vGenerationConfig = {
         temperature: 1,
         maxOutputTokens: 65535,
@@ -4761,7 +4761,7 @@ exports.cf6 = onRequest({
     };
 
     const chat = ai.chats.create({
-      model: 'gemini-3-pro-preview', //pro
+      model: 'gemini-3-pro-preview-sf', //pro
       config: vGenerationConfig,
     });
 
@@ -4947,7 +4947,7 @@ exports.cf6 = onRequest({
         try {
           const collectedUrlsVerify = new Set();
           const rawVerifyResult = await runGeminiStream({
-            model: 'gemini-3-flash-preview',
+            model: 'gemini-3-flash-preview-sf-fc',
             generationConfig: {
               temperature: 1,
               maxOutputTokens: 65535, //verification
