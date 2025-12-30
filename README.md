@@ -14,22 +14,34 @@ Self-Healing Resilience: It doesn't crash when APIs fail. Custom retry logic wit
 Cost Governance (FinOps): It tracks token usage in real-time. The system utilises Model Cascading—dynamically downgrading from expensive reasoning models (e.g., Gemini 1.5 Pro) to faster models (Flash) based on task complexity to protect margins.
 Auditability & Provenance: In regulated industries, AI cannot hallucinate. This architecture traces every generated fact back to a specific source URL, saving the evidence trail to Firestore for audit compliance.
 Polyglot Architecture: Demonstrates orchestration in Node.js (for scalable, serverless event handling) and specialised agent logic in Python (for data-heavy reasoning).
+
 Repository Structure
+
 File	Description
-orchestrator.js	The Node.js/GCP Cloud Functions backend. Handles the "Master Agent" logic, Cloud Task queueing, Firestore state management, and the multi-turn chat loops that drive the research process.
+The Node.js/GCP Cloud Functions backend. Handles the "Master Agent" logic, Cloud Task queueing, Firestore state management, and the multi-turn chat loops that drive the research process.
 deep_research_agent.py	The Python Specialist Agent. A focused reasoning agent demonstrating advanced prompt engineering, structured output parsing, and specific data analysis tasks best suited for the Python ecosystem.
+
+-----
+
 Key Architectural Patterns
+
 1. The "Deep Research" Loop (orchestrator.js)
 The system uses a recursive function calling loop to navigate the web. It doesn't just "search"; it plans, executes, reads, and refines.
 
 See: apcfSupplierFinder (Deep Research Agent).
 See: runGeminiStreamBrowserUse (The orchestration loop).
 Logic: It autonomously navigates URLs, parses unstructured PDFs (via Tika), and cross-references data against a "Fact Check" agent before committing to the database.
+
+-----
+
 2. Governance & FinOps Layer
 AI at scale is expensive. This system implements strict controls.
 
 See: logAITransaction and calculateCost.
 Logic: Every interaction is logged with exact input/output token costs. If a task exceeds a budget threshold, the system can autonomously terminate the branch or switch to a cheaper model.
+
+-----
+
 3. The "Hallucination Firewall"
 To serve enterprise clients, "truth" is non-negotiable.
 
