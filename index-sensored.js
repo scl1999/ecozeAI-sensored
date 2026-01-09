@@ -4662,10 +4662,18 @@ exports.cf6 = onRequest({
 
   // Helper to check if the AI response indicates an unknown supplier
   const isSupplierUnknown = (text) => {
-    // Make the leading asterisk optional with *?
+    // Check for standard format
     const suppMatch = text.match(/\*?supplier_name:\s*(.*?)(?=\s*\*|$)/i);
-    // True if the 'supplier_name' field is missing, empty, or literally "Unknown"
-    return !suppMatch || !suppMatch[1] || /unknown/i.test(suppMatch[1].trim());
+    if (suppMatch && suppMatch[1] && !/unknown/i.test(suppMatch[1].trim())) {
+      return false; // Known supplier found in standard format
+    }
+    // Check for estimation format
+    const mainSuppMatch = text.match(/main_supplier:\s*(.*?)(?=\s*(?:\r?\n|main_supplier_probability:|$))/i);
+    if (mainSuppMatch && mainSuppMatch[1] && !/unknown/i.test(mainSuppMatch[1].trim())) {
+      return false; // Known supplier found in estimation format
+    }
+
+    return true; // Supplier is unknown
   };
 
   try {
@@ -4682,7 +4690,7 @@ exports.cf6 = onRequest({
 
     // 1. Fetch document data and set up initial prompts
     if (isMaterial) {
-      targetRef = db.collection("c1").doc(materialId);
+      targetRef = db.collection("materials").doc(materialId);
       const mSnap = await targetRef.get();
       if (!mSnap.exists) {
         res.status(404).json({ error: `Material ${materialId} not found` });
@@ -4693,7 +4701,7 @@ exports.cf6 = onRequest({
       const materialName = (targetData.name || "").trim();
       const productChain = targetData.product_chain || '(unknown chain)';
 
-      // NEW: Fetch parent context for c1
+      // NEW: Fetch parent context for materials
       let parentContextLine = "";
       if (targetData.parent_material) {
         // Case 2: Material has a parent_material
@@ -4716,7 +4724,7 @@ exports.cf6 = onRequest({
         }
       } else if (linkedProductId) {
         // Case 1: Material has NO parent_material, check linked product
-        const pRef = db.collection("c2").doc(linkedProductId);
+        const pRef = db.collection("products_new").doc(linkedProductId);
         const pSnap = await pRef.get();
         if (pSnap.exists) {
           const pData = pSnap.data() || {};
@@ -4731,7 +4739,7 @@ exports.cf6 = onRequest({
       initialUserPrompt = `...`;
       systemPrompt = SYS_APCFSF;
     } else {
-      targetRef = db.collection("c2").doc(productId);
+      targetRef = db.collection("products_new").doc(productId);
       const pSnap = await targetRef.get();
       if (!pSnap.exists) {
         res.status(404).json({ error: `Product ${productId} not found` });
@@ -4761,7 +4769,7 @@ exports.cf6 = onRequest({
     };
 
     const chat = ai.chats.create({
-      model: 'gemini-3-pro-preview-sf', //pro
+      model: 'gemini-3-pro-sf', //pro
       config: vGenerationConfig,
     });
 
@@ -4769,9 +4777,12 @@ exports.cf6 = onRequest({
     let finalAnswer = "";
     const allAnswers = [];
     let wasEstimated = false;
+    let finalRatings = null; // Store ratings for saving
+    let supplier_probability_percentage = null; // Store probability for saving
+    let lastFcResponse = ""; // Store the last Fact Checker response for estimation context
 
     // 3. Start the multi-step conversation loop
-    const MAX_DIRECT_RETRIES = 4; // The total number of retries allowed (for both Unknown and Fact Check failures)
+    const MAX_DIRECT_RETRIES = 5; // The total number of retries allowed (for both Unknown and Fact Check failures)
     // The loop logic has changed. We don't have a fixed "totalLoopIterations".
     // Instead, we loop until we have a good answer or we hit the retry limit.
     // If we hit the retry limit, we do one final "Estimation" run.
@@ -4786,13 +4797,62 @@ exports.cf6 = onRequest({
     while (loopContinuously) {
       const isLastAttempt = retryCount >= MAX_DIRECT_RETRIES;
 
-      // If we are on the last attempt (retries exhausted), we switch to Estimation mode if we haven't already.
-      if (isLastAttempt && !wasEstimated) {
-        logger.info(`[cf6] Max retries (${MAX_DIRECT_RETRIES}) reached. Switching to estimation.`);
+      // --- START: Separate Estimation AI Logic ---
+      if (isLastAttempt) {
+        logger.info(`[cf6] Max retries (${MAX_DIRECT_RETRIES}) reached. Triggering separate Estimation AI.`);
         wasEstimated = true;
-        currentPrompt = `...
-`;
+
+        const historyContext = allTurnsForLog.join('\n\n');
+
+        const ESTIMATION_SYS_MSG = `...`;
+
+        const estimationPrompt = `...`;
+
+        try {
+          const estCollectedUrls = new Set();
+          const estResult = await runGeminiStream({
+            model: 'gemini-3-pro-sf', // Using Pro for better reasoning
+            generationConfig: {
+              temperature: 1,
+              maxOutputTokens: 65535,
+              systemInstruction: ESTIMATION_SYS_MSG,
+              tools: vGenerationConfig.tools, // Use same tools
+            },
+            user: estimationPrompt,
+            collectedUrls: estCollectedUrls,
+          });
+
+          // Merge Tokens (approximate allocation to input/output to ensure total cost is captured)
+          // estResult.totalTokens is the sum. We'll add it to totalOutputTks for simplicity in tracking.
+          totalOutputTks += estResult.totalTokens || 0;
+
+          // Merge Logs
+          allTurnsForLog.push(`--- 👤 User (Estimation) ---\n${estimationPrompt}`);
+          allTurnsForLog.push(`--- 🤖 AI (Estimation) ---\n${estResult.thoughts || ""}\n${estResult.answer}`);
+
+          // Merge URLs
+          estCollectedUrls.forEach(u => collectedUrls.add(u));
+
+          // Parse Result
+          finalAnswer = estResult.answer;
+          allAnswers.push(finalAnswer);
+
+          // Extract Probability Percentage
+          const probMatch = finalAnswer.match(/main_supplier_probability_percentage:\s*(\d+(\.\d+)?)/i);
+          if (probMatch) {
+            supplier_probability_percentage = parseFloat(probMatch[1]);
+          }
+
+          logger.info(`[cf6] Estimation complete. Probability: ${supplier_probability_percentage}%`);
+          break; // Exit main loop
+
+        } catch (estErr) {
+          logger.error(`[cf6] Estimation AI failed: ${estErr.message}`);
+          finalAnswer = "...";
+          break;
+        }
       }
+      // --- END: Separate Estimation AI Logic ---
 
       const urlsThisTurn = new Set();
       const rawChunksThisTurn = [];
@@ -4859,7 +4919,7 @@ exports.cf6 = onRequest({
       const currentTurnPayload = [...historyBeforeSend.slice(0, -1), { role: 'user', parts: [{ text: currentPrompt }] }];
 
       const { totalTokens: currentInputTks } = await ai.models.countTokens({
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3-pro-sf',
         contents: currentTurnPayload,
         systemInstruction: vGenerationConfig.systemInstruction,
         tools: vGenerationConfig.tools,
@@ -4867,13 +4927,13 @@ exports.cf6 = onRequest({
       totalInputTks += currentInputTks || 0;
 
       const { totalTokens: currentOutputTks } = await ai.models.countTokens({
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3-pro-sf',
         contents: [{ role: 'model', parts: [{ text: finalAnswer }] }]
       });
       totalOutputTks += currentOutputTks || 0;
 
       const { totalTokens: currentToolCallTks } = await ai.models.countTokens({
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3-pro-sf',
         contents: [{ role: 'model', parts: [{ text: thoughtsThisTurn }] }]
       });
       totalToolCallTks += currentToolCallTks || 0;
@@ -4881,14 +4941,20 @@ exports.cf6 = onRequest({
       // --- DECISION LOGIC ---
 
       // 1. If we forced an estimation (fallback), we accept the result and break.
-      if (wasEstimated && isLastAttempt) {
-        logger.info(`[cf6] Estimation completed (fallback).`);
-        break;
-      }
+      // REMOVED: if (wasEstimated && isLastAttempt) { ... break; } 
+      // We now allow it to proceed to Fact Checker.
+
 
       // 2. Check if the supplier is "Unknown"
       if (isSupplierUnknown(finalAnswer)) {
         logger.warn(`[cf6] Supplier is "Unknown" on attempt ${retryCount + 1}.`);
+
+        // If we are already estimating and it's still Unknown, we must give up to avoid infinite loop
+        if (wasEstimated) {
+          logger.warn(`[cf6] Estimation returned Unknown. Giving up.`);
+          break;
+        }
+
         if (retryCount < MAX_DIRECT_RETRIES) {
           retryCount++;
           logger.info(`[cf6] Retrying (Retry #${retryCount}/${MAX_DIRECT_RETRIES})...`);
@@ -4903,6 +4969,23 @@ exports.cf6 = onRequest({
       }
 
       // 3. Supplier FOUND (Directly). Now we run the Fact Checker.
+
+      // NEW: Check if we have any URLs to fact check against.
+      if (collectedUrls.size === 0) {
+        logger.warn(`[cf6] Supplier found, but NO URLs collected. Cannot run Fact Checker.`);
+
+        if (retryCount < MAX_DIRECT_RETRIES) {
+          retryCount++;
+          logger.info(`[cf6] Retrying due to missing URLs (Retry #${retryCount}/${MAX_DIRECT_RETRIES})...`);
+
+          currentPrompt = `...`;
+          continue; // Loop again
+        } else {
+          logger.info(`[cf6] Retries exhausted for missing URLs. Triggering estimation next loop.`);
+          continue;
+        }
+      }
+
       logger.info(`[cf6] Supplier found. Running Fact Checker...`);
 
       // 3a. Prepare Fact Check Data
@@ -4931,9 +5014,7 @@ exports.cf6 = onRequest({
         rawConversation: allRawChunks,
       });
 
-      const VERIFY_SYS_MSG = "[CONFIDENTIAL - REDACTED]";
-
-      let verifyUserPrompt = `...`;
+      const VERIFY_SYS_MSG = `...`;
 
       let verifyResult = null;
       let verifyAttempts = 0;
@@ -4942,26 +5023,29 @@ exports.cf6 = onRequest({
       // 3b. Run Verification Loop (internal retry for format)
       while (verifyAttempts < MAX_VERIFY_ATTEMPTS && !verifyResult) {
         verifyAttempts++;
-        logger.info(`[cf6] Calling GPT-OSS-120B verification (attempt ${verifyAttempts})...`);
+        logger.info(`[cf6] Calling Gemini-3-Pro verification (attempt ${verifyAttempts})...`);
 
         try {
           const collectedUrlsVerify = new Set();
           const rawVerifyResult = await runGeminiStream({
-            model: 'gemini-3-flash-preview-sf-fc',
+            model: 'gemini-3-flash-sffc',
             generationConfig: {
               temperature: 1,
               maxOutputTokens: 65535, //verification
-              systemInstruction: VERIFY_SYS_MSG
+              systemInstruction: VERIFY_SYS_MSG,
+              tools: [{ urlContext: {} }],
+              thinkingConfig: {
+                includeThoughts: true,
+                thinkingBudget: 32768
+              }
             },
             user: verifyUserPrompt,
             collectedUrls: collectedUrlsVerify,
-            useUrlContext: true,
-            useGoogleSearch: true
           });
 
           // Check format
-          const hasRating = /\*rating:/i.test(rawVerifyResult.answer);
-          const hasReasoning = /\*rating_reasoning:/i.test(rawVerifyResult.answer);
+          const hasRating = /\*rating_\d+:/i.test(rawVerifyResult.answer);
+          const hasReasoning = /\*rating_reasoning_\d+:/i.test(rawVerifyResult.answer);
 
           if (hasRating && hasReasoning) {
             verifyResult = rawVerifyResult;
@@ -4992,13 +5076,13 @@ exports.cf6 = onRequest({
         factCheckCount++;
         // Log verification transaction FIRST
         await logAITransaction({
-          cfName: `apcfSupplierFinderFactCheck_${factCheckCount}`,
+          cfName: `cf6FactCheck_${factCheckCount}`,
           productId: isMaterial ? linkedProductId : productId,
           materialId: materialId,
           cost: verifyResult.cost,
           totalTokens: verifyResult.totalTokens,
           searchQueries: verifyResult.searchQueries || [],
-          modelUsed: 'gemini-3-flash-preview',
+          modelUsed: 'gemini-3-flash-sffc',
         });
 
         // Log reasoning for the fact check (excluded from summarizer by naming convention)
@@ -5007,77 +5091,299 @@ exports.cf6 = onRequest({
           user: verifyUserPrompt,
           thoughts: verifyResult.thoughts || "",
           answer: verifyResult.answer,
-          cloudfunction: `apcfSupplierFinderFactCheck_${factCheckCount}`,
+          cloudfunction: `cf6FactCheck_${factCheckCount}`,
           productId: isMaterial ? linkedProductId : productId,
           materialId: materialId,
           rawConversation: verifyResult.rawConversation,
         });
 
-        const ratingMatch = verifyResult.answer.match(/\*rating:\s*(?:\["?|"?)(.*?)(?:\]"?|"?)(?:\r?\n|\*|$)/i);
-        const reasoningMatch = verifyResult.answer.match(/\*rating_reasoning:\s*([\s\S]*)/i);
-        const rating = ratingMatch ? ratingMatch[1].trim() : '';
-        const ratingReasoning = reasoningMatch ? reasoningMatch[1].trim() : '';
+        // Parse all ratings
+        const ratings = [];
+        // Updated regex to capture supplier name as well
+        // Format: *supplier_N: ... *rating_N: ... *rating_reasoning_N: ...
+        // We iterate by finding *supplier_N blocks
 
-        logger.info(`[cf6] Fact Check Rating: ${rating}`);
+        const supplierBlockRegex = /\*supplier_(\d+):\s*([^\r\n]+)/gi;
+        let sMatch;
+
+        while ((sMatch = supplierBlockRegex.exec(verifyResult.answer)) !== null) {
+          const id = sMatch[1];
+          const supplierName = sMatch[2].trim();
+
+          // Find corresponding rating and reasoning for this ID
+          const ratingRegex = new RegExp(`\\*rating_${id}:\\s*(?:\\["?|"?)(.*?)(?:\\]"?|"?)(?:\\r?\\n|\\*|$)`, 'i');
+          const reasoningRegex = new RegExp(`\\*rating_reasoning_${id}:\\s*([\\s\\S]*?)(?=\\s*(?:\\r?\\n\\*supplier_|\\r?\\n\\*rating_|\\r?\\n\\*rating_reasoning_|$))`, 'i');
+
+          const rMatch = verifyResult.answer.match(ratingRegex);
+          const reasonMatch = verifyResult.answer.match(reasoningRegex);
+
+          const ratingText = rMatch ? rMatch[1].trim() : "Unknown";
+          const reasoningText = reasonMatch ? reasonMatch[1].trim() : "";
+
+          ratings.push({
+            id: id,
+            name: supplierName,
+            rating: ratingText,
+            reasoning: reasoningText
+          });
+        }
+
+        logger.info(`[cf6] Fact Check Ratings parsed: ${ratings.length}`);
 
         // Determine Pass/Fail
-        const isWeak = /Weak \/ Speculative/i.test(rating);
-        const isNoEvidence = /No Evidence/i.test(rating);
-        const isFactCheckFailed = isWeak || isNoEvidence;
+        // Fail if ANY supplier has a "bad" rating (Probable, Weak / Speculative OR No Evidence)
+        const badRatings = ratings.filter(r =>
+          /Weak \/ Speculative/i.test(r.rating) ||
+          /No Evidence/i.test(r.rating)
+        );
+        const isFactCheckFailed = badRatings.length > 0;
 
         if (isFactCheckFailed) {
-          logger.warn(`[cf6] Fact check FAILED (` + rating + `).`);
+          logger.warn(`[cf6] Fact check FAILED for ${badRatings.length} suppliers.`);
+
+          if (wasEstimated) {
+            logger.info("[cf6] Estimation fact check failed (low confidence). Saving as is.");
+            finalRatings = ratings;
+            break;
+          }
 
           // If we have retries left, we try again with specific feedback
           if (retryCount < MAX_DIRECT_RETRIES) {
             retryCount++;
             logger.info(`[cf6] Retrying with feedback (Retry #${retryCount}/${MAX_DIRECT_RETRIES})...`);
 
-            // Construct feedback prompt
-            // Note: We must fetch the *Fact Checker's URLs* to include in the feedback source list
-            // We access 'collectedUrls' but strictly we want the ones from the verify run. 
-            // However, since we merged them, we can just output 'cleanUrls' + any new ones. 
-            // A simpler way is to just output the URLs currently known.
-
             const currentAllUrls = [];
             for (const u of collectedUrls) {
-              // We do a quick clean/check (async unwrap not needed again if we just want raw strings)
               if (typeof u === 'string' && u.trim()) currentAllUrls.push(u.trim());
             }
+
+            // Construct feedback string from all ratings
+            const feedbackDetails = ratings.map(r => `Supplier ${r.id}: ${r.rating}\nReasoning: ${r.reasoning}`).join('\n\n');
+
+            // Capture feedback for potential estimation
+            lastFcResponse = `Fact Checker Response:\n${feedbackDetails}\n\nSources:\n${currentAllUrls.join('\n')}`;
 
             currentPrompt = `...`;
             continue; // Loop again
           } else {
-            logger.info(`[cf6] Retries exhausted for Fact Check failure, triggers estimation next loop.`);
-            continue; // Loop again (triggers estimation at top of loop)
+            logger.info(`[cf6] Retries exhausted for Fact Check failure.`);
+
+            // FALLBACK LOGIC
+            // Check if ALL are bad -> Estimate
+            // Check if SOME are good -> Filter & Promote
+
+            const goodRatings = ratings.filter(r =>
+              !/Weak \/ Speculative/i.test(r.rating) &&
+              !/No Evidence/i.test(r.rating)
+            );
+
+            if (goodRatings.length === 0) {
+              logger.info(`[cf6] All suppliers failed verification. Triggering estimation next loop.`);
+              continue; // Triggers estimation at top of loop
+            } else {
+              // NEW: Check if we only have "Probable" results and haven't estimated yet.
+              // If so, we should try to estimate to see if we can get a better result.
+              const hasBetterThanProbable = goodRatings.some(r =>
+                /Direct Proof/i.test(r.rating) ||
+                /Strong Inference/i.test(r.rating)
+              );
+
+              if (!hasBetterThanProbable && !wasEstimated) {
+                logger.info(`[cf6] Only found 'Probable' suppliers. Triggering estimation to attempt better results.`);
+                continue;
+              }
+
+              logger.info(`[cf6] Some suppliers passed verification. Filtering and promoting...`);
+
+              // We need to map the ratings back to the actual supplier names from the AI's previous answer (finalAnswer)
+              // This is tricky because we only have IDs 1, 2, 3... from the verifier.
+              // We assume the verifier respected the order: 1 = main, 2 = other_1, 3 = other_2...
+              // Let's parse the ORIGINAL answer to get the names.
+
+              const mainSuppMatch = finalAnswer.match(/\*?supplier_name:\s*(.*?)(?=\s*\*|$)/i);
+              const mainSupplierName = mainSuppMatch ? mainSuppMatch[1].trim() : null;
+
+              const otherSuppliersMap = []; // [{id: 1, name: ...}, {id: 2, name: ...}] (indices for 'other')
+              // Actually, let's just make a flat list of ALL suppliers in order: [Main, Other1, Other2...]
+
+              const allSuppliersOrdered = [];
+              if (mainSupplierName) allSuppliersOrdered.push({ type: 'main', name: mainSupplierName, originalIndex: 0 });
+
+              const otherSuppRegex = /(?<!reasoning_)\*?other_supplier_(\d+):\s*([^\r\n]+)/gi;
+              let om;
+              while ((om = otherSuppRegex.exec(finalAnswer)) !== null) {
+                allSuppliersOrdered.push({ type: 'other', name: om[2].trim(), originalIndex: parseInt(om[1]) }); // Index might not be sequential in raw text but usually is
+              }
+
+              // Now match with goodRatings using NAME matching
+              // We have `allSuppliersOrdered` which contains the original names from the AI.
+              // We have `goodRatings` which contains the names returned by the Verifier.
+              // We need to find which original suppliers passed.
+
+              const validSuppliers = [];
+
+              // Create a map of good rating names for fuzzy matching
+              const goodNames = goodRatings.map(r => r.name.toLowerCase());
+
+              for (const originalSupp of allSuppliersOrdered) {
+                // Check if this original supplier is in the good list
+                // Simple includes check or fuzzy match?
+                // The verifier is asked to return the name "exactly as the AI gave us", so strict match should work, 
+                // but let's be robust with lowercase.
+
+                const origName = originalSupp.name.toLowerCase();
+                // Check if any good rating name contains this original name or vice versa
+                const isGood = goodNames.some(gn => gn.includes(origName) || origName.includes(gn));
+
+                if (isGood) {
+                  validSuppliers.push(originalSupp);
+                }
+              }
+
+              if (validSuppliers.length > 0) {
+                // Promote first valid to Main
+                const newMain = validSuppliers[0];
+                const newOthers = validSuppliers.slice(1);
+
+                const upd = {};
+                if (isMaterial) upd.supplier_name = newMain.name;
+                else upd.manufacturer_name = newMain.name;
+
+                // Capture ratings for the promoted ones
+                // We need to find the rating object for each valid supplier
+                finalRatings = [];
+                for (const vs of validSuppliers) {
+                  // Find the rating that matched this supplier
+                  // We know it matched one of the goodRatings
+                  const matchedRating = goodRatings.find(r => {
+                    const gn = r.name.toLowerCase();
+                    const on = vs.name.toLowerCase();
+                    return gn.includes(on) || on.includes(gn);
+                  });
+                  if (matchedRating) {
+                    finalRatings.push({
+                      ...matchedRating,
+                      name: vs.name // Use the original name
+                    });
+                  }
+                }
+
+                if (newOthers.length > 0) {
+                  upd.other_known_suppliers = admin.firestore.FieldValue.arrayUnion(...newOthers.map(s => s.name));
+                }
+
+                // Save FCR info (just saving the raw verification result for record)
+                upd.supplier_finder_fcr = "Mixed/Filtered";
+                upd.supplier_finder_fcr_reasoning = "Filtered out weak suppliers: " + badRatings.map(r => r.id).join(', ');
+
+                upd.supplier_finder_retries = retryCount;
+
+                await targetRef.update(upd);
+                logger.info(`[cf6] Saved filtered/promoted data: ${JSON.stringify(upd)}`);
+
+                finalAnswer = "MANUALLY_HANDLED";
+                break;
+              } else {
+                // Should not happen if goodRatings > 0
+                logger.warn("Logic error: Good ratings found but mapping failed. Triggering estimation.");
+                continue;
+              }
+            }
           }
 
         } else {
-          // Fact Check PASSED
-          logger.info(`[cf6] Fact check PASSED. Saving result.`);
-          // We also want to save the rating/reasoning to the DB
-          try {
-            await targetRef.update({
-              supplier_finder_fcr: rating,
-              supplier_finder_fcr_reasoning: ratingReasoning
-            });
-          } catch (e) { logger.warn('Failed to update FCR', e); }
+          // Fact Check PASSED (All good)
 
-          break; // Exit main loop successfully
+          // NEW: Check if we only have "Probable" results and haven't estimated yet.
+          const hasBetterThanProbable = ratings.some(r =>
+            /Direct Proof/i.test(r.rating) ||
+            /Strong Inference/i.test(r.rating)
+          );
+
+          if (!hasBetterThanProbable && !wasEstimated) {
+            logger.info(`[cf6] Fact Check passed but only found 'Probable' suppliers. Triggering estimation to attempt better results.`);
+            continue;
+          }
+
+          logger.info(`[cf6] Fact check PASSED. Reshuffling and saving result.`);
+
+          // RESHUFFLING LOGIC (Same as Filter/Promote but for ALL passed)
+          const mainSuppMatch = finalAnswer.match(/\*?supplier_name:\s*(.*?)(?=\s*\*|$)/i);
+          const mainSupplierName = mainSuppMatch ? mainSuppMatch[1].trim() : null;
+          const allSuppliersOrdered = [];
+          if (mainSupplierName) allSuppliersOrdered.push({ type: 'main', name: mainSupplierName, originalIndex: 0 });
+
+          const otherSuppRegex = /(?<!reasoning_)\*?other_supplier_(\d+):\s*([^\r\n]+)/gi;
+          let om;
+          while ((om = otherSuppRegex.exec(finalAnswer)) !== null) {
+            allSuppliersOrdered.push({ type: 'other', name: om[2].trim(), originalIndex: parseInt(om[1]) });
+          }
+
+          const validSuppliers = [];
+          for (const originalSupp of allSuppliersOrdered) {
+            const origName = originalSupp.name.toLowerCase();
+            const matchedRating = ratings.find(r => {
+              const gn = r.name.toLowerCase();
+              return gn.includes(origName) || origName.includes(gn);
+            });
+            if (matchedRating) {
+              validSuppliers.push({ ...originalSupp, ratingObj: matchedRating });
+            }
+          }
+
+          if (validSuppliers.length > 0) {
+            // Sort by rating priority
+            const ratingPriority = { "Direct Proof": 1, "Strong Inference": 2, "Probable": 3, "Weak": 4, "No Evidence": 5 };
+            const getP = (txt) => {
+              for (const k in ratingPriority) if (txt.includes(k)) return ratingPriority[k];
+              return 5;
+            };
+            validSuppliers.sort((a, b) => getP(a.ratingObj.rating) - getP(b.ratingObj.rating));
+
+            const newMain = validSuppliers[0];
+            const newOthers = validSuppliers.slice(1);
+
+            const upd = {};
+            if (isMaterial) upd.supplier_name = newMain.name;
+            else upd.manufacturer_name = newMain.name;
+
+            // Capture ratings correctly
+            finalRatings = validSuppliers.map(vs => ({ ...vs.ratingObj, name: vs.name }));
+
+            if (newOthers.length > 0) {
+              upd.other_known_suppliers = admin.firestore.FieldValue.arrayUnion(...newOthers.map(s => s.name));
+            }
+
+            // Save FCR info
+            const ratingSummary = finalRatings.map(r => `[${r.id}] ${r.rating}`).join('; ');
+            const reasoningSummary = finalRatings.map(r => `[${r.id}] ${r.reasoning}`).join('\n---\n');
+            upd.supplier_finder_fcr = ratingSummary;
+            upd.supplier_finder_fcr_reasoning = reasoningSummary;
+            upd.supplier_finder_retries = retryCount;
+
+            await targetRef.update(upd);
+            logger.info(`[cf6] Saved reshuffled data: ${JSON.stringify(upd)}`);
+
+            finalAnswer = "MANUALLY_HANDLED";
+            break;
+          } else {
+            // Fallback if parsing fails (shouldn't happen if passed)
+            logger.warn("[cf6] Fact Check passed but parsing failed for reshuffle. Saving as is.");
+            finalRatings = ratings;
+            break;
+          }
         }
 
       } else {
-        // Verification system failed to run or return valid result (e.g. error)
-        // In this case we probably shouldn't block the result if it was a system error, 
-        // but strictly, if we can't verify, maybe we should warn.
-        // For now, if verification errors out completely, we assume we Accept the result to avoid infinite loops on system errors.
         logger.error(`[cf6] Fact checker crashed or failed format. Accepting main AI result to prevent stall.`);
         break;
       }
     }
 
     const upd = {};
-    if (wasEstimated) {
+    const supplierConfidenceMap = {}; // Map to store confidence scores
+
+    if (wasEstimated && finalAnswer !== "MANUALLY_HANDLED") { // Only process estimation parsing if not already handled by filter logic
       const aggregatedFinalAnswer = allAnswers.join('\n');
       logger.info("[cf6] Processing estimated supplier response.");
       const mainSuppMatch = aggregatedFinalAnswer.match(/(?<!reasoning_)main_supplier:\s*([\s\S]*?)(?=\s*(?:\r?\n|main_supplier_probability:|$))/i);
@@ -5087,10 +5393,17 @@ exports.cf6 = onRequest({
       const otherSuppRegex = /(?<!reasoning_)other_potential_supplier_(\d+):\s*([\s\S]*?)(?=\s*(?:\r?\n|other_potential_supplier_probability_\1|$))/gi;
       let match;
       while ((match = otherSuppRegex.exec(aggregatedFinalAnswer)) !== null) {
-        const name = match[2].trim().replace(/\r?\n/g, ' '); // Clean up newlines
-        const confidence = match[3].trim();
+        const id = match[1];
+        const name = match[2].trim().replace(/\r?\n/g, ' ');
+
+        // Find the probability for this specific ID
+        const probabilityRegex = new RegExp(`(?<!reasoning_)other_potential_supplier_probability_${id}:\\s*("?[^"\\n]*"?)`, 'i');
+        const probMatch = aggregatedFinalAnswer.match(probabilityRegex);
+        const confidence = probMatch ? probMatch[1].trim() : "Unknown";
+
         if (name) { // Ensure the name is not empty
           otherSuppliers.push(`${name} (${confidence})`);
+          supplierConfidenceMap[name.toLowerCase()] = confidence;
         }
       }
 
@@ -5102,16 +5415,19 @@ exports.cf6 = onRequest({
         if (isMaterial) {
           upd.supplier_name = mainSupplier;
           upd.supplier_confidence = probability;
+          if (supplier_probability_percentage !== null) upd.supplier_probability_percentage = supplier_probability_percentage;
         } else {
           upd.manufacturer_name = mainSupplier;
           upd.manufacturer_confidence = probability;
+          if (supplier_probability_percentage !== null) upd.manufacturer_probability_percentage = supplier_probability_percentage;
         }
+        upd.supplier_estimated = true;
       }
       if (otherSuppliers.length > 0) {
         upd.other_potential_suppliers = otherSuppliers;
       }
 
-    } else if (!isSupplierUnknown(finalAnswer)) {
+    } else if (finalAnswer !== "MANUALLY_HANDLED" && !isSupplierUnknown(finalAnswer)) {
       logger.info("[cf6] Processing direct supplier response.");
       // Make the leading asterisk optional with *?
       const suppMatch = finalAnswer.match(/\*?supplier_name:\s*(.*?)(?=\s*\*|$)/i);
@@ -5121,12 +5437,13 @@ exports.cf6 = onRequest({
         if (value.toLowerCase() !== 'unknown' && !value.startsWith('*')) {
           if (isMaterial) upd.supplier_name = value;
           else upd.manufacturer_name = value;
+          upd.supplier_estimated = false;
         }
       }
 
       // --- START: New Logic for other_known_suppliers ---
       const otherSuppliers = [];
-      const otherSuppRegex = /\*?other_supplier_(\d+):\s*([^\r\n]+)/gi;
+      const otherSuppRegex = /(?<!reasoning_)\*?other_supplier_(\d+):\s*([^\r\n]+)/gi;
       let otherMatch;
 
       while ((otherMatch = otherSuppRegex.exec(finalAnswer)) !== null) {
@@ -5146,6 +5463,87 @@ exports.cf6 = onRequest({
       logger.warn("[cf6] Loop finished without a valid supplier.");
     }
 
+    // --- NEW: Save Evidence Ratings and Structured Other Suppliers ---
+    if (finalRatings && finalRatings.length > 0) {
+      const ratingMap = {
+        "Direct Proof": 1,
+        "Strong Inference": 2,
+        "Probable / General Partner": 3,
+        "Weak / Speculative": 4,
+        "No Evidence": 5
+      };
+
+      const getRatingInt = (text) => {
+        if (!text) return 5;
+        // Clean text (remove brackets etc)
+        const clean = text.replace(/[\[\]"]/g, '').trim();
+        // Find key that matches
+        for (const [key, val] of Object.entries(ratingMap)) {
+          if (clean.toLowerCase().includes(key.toLowerCase())) return val;
+        }
+        return 5; // Default
+      };
+
+      // 1. Main Supplier Rating
+      // Assuming the first rating corresponds to the main supplier (ID 1)
+      // Or we should match by name if possible. 
+      // In the standard flow, ID 1 is usually the main supplier.
+      // In the filtered flow, we promoted one to main.
+
+      // Let's try to match the *saved* main supplier name to the ratings
+      const savedMainName = isMaterial ? upd.supplier_name : upd.manufacturer_name;
+
+      if (savedMainName) {
+        const mainRatingObj = finalRatings.find(r => r.name.toLowerCase().includes(savedMainName.toLowerCase()) || savedMainName.toLowerCase().includes(r.name.toLowerCase()));
+        if (mainRatingObj) {
+          upd.supplier_evidence_rating = getRatingInt(mainRatingObj.rating);
+        } else if (finalRatings.length > 0) {
+          // Fallback to first rating if name match fails (e.g. slight variation)
+          upd.supplier_evidence_rating = getRatingInt(finalRatings[0].rating);
+        }
+      }
+
+      // 2. Other Suppliers Structured
+      // We need to save to /other_suppliers (List<Custom Data Type>)
+      // /name, /evidence_rating, /rating_reasoning
+
+      const structuredOthers = [];
+
+      // We want to include all "other" suppliers.
+      // If we are in "MANUALLY_HANDLED" mode (filtered), 'other_known_suppliers' has the names.
+      // If we are in standard mode, 'other_known_suppliers' has the names.
+
+      // Let's iterate through finalRatings and find those that are NOT the main supplier
+      // But wait, finalRatings contains everything.
+
+      for (const r of finalRatings) {
+        // Check if this is the main supplier
+        const isMain = savedMainName && (r.name.toLowerCase().includes(savedMainName.toLowerCase()) || savedMainName.toLowerCase().includes(r.name.toLowerCase()));
+
+        if (!isMain) {
+          structuredOthers.push({
+            name: r.name,
+            evidence_rating: getRatingInt(r.rating),
+            rating_reasoning: r.reasoning,
+            confidence_score: (() => {
+              const rawConf = supplierConfidenceMap[r.name.toLowerCase()];
+              if (rawConf) {
+                const parsed = parseFloat(rawConf.replace(/[^0-9.]/g, ''));
+                return isNaN(parsed) ? null : parsed;
+              }
+              return null;
+            })()
+          });
+        }
+      }
+
+      if (structuredOthers.length > 0) {
+        upd.other_suppliers = structuredOthers;
+      }
+    }
+    // --- END: New Evidence Rating Logic ---
+
+
     upd.supplier_finder_retries = retryCount;
     if (Object.keys(upd).length > 0) {
       await targetRef.update(upd);
@@ -5155,14 +5553,21 @@ exports.cf6 = onRequest({
     // 6. Save URLs and finalize
     const formattedConversation = allTurnsForLog.join('\n\n');
 
+    const tokens = {
+      input: totalInputTks,
+      output: totalOutputTks,
+      toolCalls: totalToolCallTks,
+    };
+    const cost = calculateCost('gemini-3-pro-sf', tokens);
+
     await logAITransaction({
       cfName: 'cf6',
       productId: isMaterial ? linkedProductId : productId,
       materialId: materialId,
-      cost: calculateCost('gemini-3-pro-preview', totalInputTks, totalOutputTks),
-      totalTokens: totalInputTks + totalOutputTks,
+      cost,
+      totalTokens: totalInputTks + totalOutputTks + totalToolCallTks,
       searchQueries: Array.from(allSearchQueries),
-      modelUsed: 'gemini-3-pro-preview',
+      modelUsed: 'gemini-3-pro-sf',
     });
 
     await logAIReasoning({
@@ -5188,7 +5593,7 @@ exports.cf6 = onRequest({
       cloudfunction: 'cf6',
     });
 
-    await targetRef.update({ apcfSupplierFinder_done: true });
+    await targetRef.update({ cf6_done: true });
     res.json("Done");
 
   } catch (err) {
